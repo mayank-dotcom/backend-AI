@@ -14,6 +14,7 @@ import { RecursiveCharacterTextSplitter } from "langchain/text_splitter";
 import { MongoDBAtlasVectorSearch } from "@langchain/community/vectorstores/mongodb_atlas";
 import { OpenAIEmbeddings } from "@langchain/openai";
 import fetch from 'node-fetch';
+import { encoding_for_model } from '@dqbd/tiktoken';
 
 dotenv.config();
 
@@ -22,6 +23,76 @@ globalThis.fetch = fetch;
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Token encoder for cost estimation
+const enc = encoding_for_model('gpt-3.5-turbo');
+
+// OpenAI pricing (per 1K tokens) - updated as of 2024
+const PRICING = {
+  'gpt-3.5-turbo': {
+    input: 0.0005,
+    output: 0.0015
+  },
+  'text-embedding-3-large': {
+    input: 0.00013,
+    output: 0
+  }
+};
+
+// Utility functions for cost calculation
+function countTokens(text) {
+  try {
+    return enc.encode(text).length;
+  } catch (error) {
+    // Fallback estimation: ~4 chars per token
+    return Math.ceil(text.length / 4);
+  }
+}
+
+function calculateCost(inputTokens, outputTokens, model) {
+  const pricing = PRICING[model] || PRICING['gpt-3.5-turbo'];
+  const inputCost = (inputTokens / 1000) * pricing.input;
+  const outputCost = (outputTokens / 1000) * pricing.output;
+  return {
+    inputCost,
+    outputCost,
+    totalCost: inputCost + outputCost,
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens
+  };
+}
+
+// Request timing middleware
+app.use((req, res, next) => {
+  req.startTime = Date.now();
+  const originalSend = res.send;
+  
+  res.send = function(data) {
+    const duration = Date.now() - req.startTime;
+    
+    // Add timing to response if it's JSON
+    if (res.getHeader('content-type')?.includes('application/json')) {
+      try {
+        const jsonData = typeof data === 'string' ? JSON.parse(data) : data;
+        if (typeof jsonData === 'object' && jsonData !== null) {
+          jsonData.timing = {
+            requestDuration: duration,
+            timestamp: new Date().toISOString()
+          };
+          data = JSON.stringify(jsonData);
+        }
+      } catch (e) {
+        // If parsing fails, just add timing info to console
+        console.log(`Request to ${req.path} took ${duration}ms`);
+      }
+    }
+    
+    originalSend.call(this, data);
+  };
+  
+  next();
+});
 
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
@@ -85,11 +156,27 @@ async function connectDB() {
 
 async function generateEmbedding(text) {
   try {
+    const startTime = Date.now();
+    const inputTokens = countTokens(text);
+    
     const response = await openai.embeddings.create({
       model: "text-embedding-3-large",
       input: text,
     });
-    return response.data[0].embedding;
+    
+    const embeddingTime = Date.now() - startTime;
+    const cost = calculateCost(inputTokens, 0, 'text-embedding-3-large');
+    
+    console.log(`Embedding generated - Tokens: ${inputTokens}, Cost: $${cost.totalCost.toFixed(6)}, Time: ${embeddingTime}ms`);
+    
+    return {
+      embedding: response.data[0].embedding,
+      metrics: {
+        tokens: inputTokens,
+        cost: cost.totalCost,
+        duration: embeddingTime
+      }
+    };
   } catch (error) {
     console.error("Error generating embedding:", error);
     throw error;
@@ -158,7 +245,9 @@ async function generateEmbeddingsFromSource(source, collection, documentId) {
 
 async function vectorSearch(query, limit = 5) {
   try {
-    const queryEmbedding = await generateEmbedding(query);
+    const searchStartTime = Date.now();
+    const embeddingResult = await generateEmbedding(query);
+    const queryEmbedding = embeddingResult.embedding;
     
     const pipeline = [
       {
@@ -180,7 +269,17 @@ async function vectorSearch(query, limit = 5) {
     ];
 
     const results = await collection.aggregate(pipeline).toArray();
-    return results;
+    const searchDuration = Date.now() - searchStartTime;
+    
+    return {
+      results,
+      metrics: {
+        embeddingMetrics: embeddingResult.metrics,
+        searchDuration,
+        totalDuration: searchDuration,
+        resultsCount: results.length
+      }
+    };
   } catch (error) {
     console.error("Vector search error:", error);
     throw error;
@@ -239,10 +338,17 @@ async function addToHistory(sessionId, role, content) {
 async function rerankResults(query, searchResults, limit = 3) {
   try {
     if (searchResults.length <= 1) {
-      return searchResults; 
+      return {
+        results: searchResults,
+        metrics: {
+          tokens: 0,
+          cost: 0,
+          duration: 0
+        }
+      };
     }
 
-    
+    const rerankStartTime = Date.now();
     const documentsText = searchResults.map((result, index) => 
       `Document ${index + 1}:\n${result.text.substring(0, 800)}...`
     ).join('\n\n---\n\n');
@@ -257,26 +363,39 @@ ${documentsText}
 Respond with ONLY a JSON array of document numbers ordered by relevance (most relevant first).
 Example: [2, 1, 3]`;
 
+    const systemMessage = "You are a document relevance ranking expert. Analyze the query and documents to provide accurate relevance rankings.";
+    const inputTokens = countTokens(systemMessage + rerankPrompt);
+    
     const response = await openai.chat.completions.create({
       model: "gpt-3.5-turbo",
       messages: [
-        { role: "system", content: "You are a document relevance ranking expert. Analyze the query and documents to provide accurate relevance rankings." },
+        { role: "system", content: systemMessage },
         { role: "user", content: rerankPrompt }
       ],
       temperature: 0.1,
       max_tokens: 100
     });
 
+    const outputTokens = countTokens(response.choices[0].message.content);
+    const cost = calculateCost(inputTokens, outputTokens, 'gpt-3.5-turbo');
+    const rerankDuration = Date.now() - rerankStartTime;
     
     let ranking;
     try {
       ranking = JSON.parse(response.choices[0].message.content.trim());
     } catch (parseError) {
       console.error("Failed to parse reranking response:", response.choices[0].message.content);
-      return searchResults; 
+      return {
+        results: searchResults,
+        metrics: {
+          tokens: cost.totalTokens,
+          cost: cost.totalCost,
+          duration: rerankDuration,
+          error: "Failed to parse reranking response"
+        }
+      };
     }
 
-    
     const rerankedResults = [];
     for (const docNum of ranking) {
       const index = docNum - 1; 
@@ -289,7 +408,6 @@ Example: [2, 1, 3]`;
       }
     }
 
-    
     searchResults.forEach((result, index) => {
       if (!rerankedResults.find(r => r.text === result.text)) {
         rerankedResults.push({
@@ -300,18 +418,34 @@ Example: [2, 1, 3]`;
       }
     });
 
-    console.log(`Reranking completed: Original order vs Reranked order: [${searchResults.map((_, i) => i + 1).join(', ')}] -> [${ranking.join(', ')}]`);
+    console.log(`Reranking completed - Tokens: ${cost.totalTokens}, Cost: $${cost.totalCost.toFixed(6)}, Time: ${rerankDuration}ms`);
     
-    return rerankedResults.slice(0, limit);
+    return {
+      results: rerankedResults.slice(0, limit),
+      metrics: {
+        tokens: cost.totalTokens,
+        cost: cost.totalCost,
+        duration: rerankDuration
+      }
+    };
   } catch (error) {
     console.error("Error during reranking:", error);
-    return searchResults; 
+    return {
+      results: searchResults,
+      metrics: {
+        tokens: 0,
+        cost: 0,
+        duration: 0,
+        error: error.message
+      }
+    };
   }
 }
 
 
 async function generateResponseWithCitations(query, searchResults, chatHistory) {
   try {
+    const responseStartTime = Date.now();
     
     const contextWithCitations = searchResults
       .map((result, index) => {
@@ -347,6 +481,10 @@ Example of proper citation format:
       { role: "user", content: query }
     ];
 
+    // Calculate input tokens
+    const inputText = messages.map(m => m.content).join('\n');
+    const inputTokens = countTokens(inputText);
+    
     const response = await openai.chat.completions.create({
       model: "gpt-3.5-turbo",
       messages: messages,
@@ -355,6 +493,9 @@ Example of proper citation format:
     });
 
     const responseText = response.choices[0].message.content;
+    const outputTokens = countTokens(responseText);
+    const cost = calculateCost(inputTokens, outputTokens, 'gpt-3.5-turbo');
+    const responseDuration = Date.now() - responseStartTime;
     
    
     const citationRegex = /\[(\d+)\]/g;
@@ -382,12 +523,17 @@ Example of proper citation format:
         };
       });
 
-    console.log(`Generated response with ${foundCitations.size} citations: [${Array.from(foundCitations).sort().join(', ')}]`);
+    console.log(`Generated response - Citations: ${foundCitations.size}, Tokens: ${cost.totalTokens}, Cost: $${cost.totalCost.toFixed(6)}, Time: ${responseDuration}ms`);
 
     return {
       response: responseText,
       citations: Array.from(foundCitations).sort(),
-      sourceSnippets: sourceSnippets
+      sourceSnippets: sourceSnippets,
+      metrics: {
+        tokens: cost.totalTokens,
+        cost: cost.totalCost,
+        duration: responseDuration
+      }
     };
   } catch (error) {
     console.error("Error generating response with citations:", error);
@@ -536,33 +682,46 @@ app.post('/chat', async (req, res) => {
       return res.status(400).json({ error: 'Message is required' });
     }
 
-    
+    const chatStartTime = Date.now();
     const chatHistory = await getChatHistory(sessionId);
 
-    
-    const searchResults = await vectorSearch(message, 10);
+    // Perform vector search with metrics
+    const searchData = await vectorSearch(message, 10);
+    const searchResults = searchData.results || searchData; // Handle both old and new format
     
     if (searchResults.length === 0) {
       const response = "The document posssibly doesn't have any information about that.";
       await addToHistory(sessionId, 'user', message);
       await addToHistory(sessionId, 'assistant', response);
       
+      const totalDuration = Date.now() - chatStartTime;
       return res.json({
         response,
         sessionId,
-        searchResults: []
+        searchResults: [],
+        metrics: {
+          totalDuration,
+          searchMetrics: searchData.metrics || null,
+          totalCost: searchData.metrics?.cost || 0,
+          totalTokens: searchData.metrics?.tokens || 0
+        }
       });
     }
 
-    
-    const rerankedResults = await rerankResults(message, searchResults, 3);
+    // Rerank results with metrics
+    const rerankData = await rerankResults(message, searchResults, 3);
+    const rerankedResults = rerankData.results || rerankData; // Handle both old and new format
 
-    
+    // Generate response with citations and metrics
     const responseWithCitations = await generateResponseWithCitations(message, rerankedResults, chatHistory);
 
-    
+    // Save to history
     await addToHistory(sessionId, 'user', message);
     await addToHistory(sessionId, 'assistant', responseWithCitations.response);
+
+    const totalDuration = Date.now() - chatStartTime;
+    const totalCost = (searchData.metrics?.cost || 0) + (rerankData.metrics?.cost || 0) + (responseWithCitations.metrics?.cost || 0);
+    const totalTokens = (searchData.metrics?.tokens || 0) + (rerankData.metrics?.tokens || 0) + (responseWithCitations.metrics?.tokens || 0);
 
     res.json({
       response: responseWithCitations.response,
@@ -574,7 +733,17 @@ app.post('/chat', async (req, res) => {
         originalScore: r.originalScore || r.score,
         rerankPosition: r.rerankPosition,
         isReranked: !!r.rerankPosition
-      }))
+      })),
+      metrics: {
+        totalDuration,
+        totalCost,
+        totalTokens,
+        breakdown: {
+          search: searchData.metrics || null,
+          rerank: rerankData.metrics || null,
+          response: responseWithCitations.metrics || null
+        }
+      }
     });
 
   } catch (error) {
@@ -658,15 +827,23 @@ app.post('/search', async (req, res) => {
       return res.status(400).json({ error: 'Query is required' });
     }
 
-    
+    const searchStartTime = Date.now();
     const searchLimit = useReranking ? Math.max(limit * 3, 10) : limit;
-    const results = await vectorSearch(query, searchLimit);
+    const searchData = await vectorSearch(query, searchLimit);
+    const results = searchData.results || searchData; // Handle both formats
     
     let finalResults = results;
+    let rerankMetrics = null;
     
     if (useReranking && results.length > 1) {
-      finalResults = await rerankResults(query, results, limit);
+      const rerankData = await rerankResults(query, results, limit);
+      finalResults = rerankData.results || rerankData;
+      rerankMetrics = rerankData.metrics;
     }
+    
+    const totalDuration = Date.now() - searchStartTime;
+    const totalCost = (searchData.metrics?.cost || 0) + (rerankMetrics?.cost || 0);
+    const totalTokens = (searchData.metrics?.tokens || 0) + (rerankMetrics?.tokens || 0);
     
     res.json({
       query,
@@ -677,7 +854,16 @@ app.post('/search', async (req, res) => {
         originalScore: r.originalScore || r.score,
         rerankPosition: r.rerankPosition,
         isReranked: !!r.rerankPosition
-      }))
+      })),
+      metrics: {
+        totalDuration,
+        totalCost,
+        totalTokens,
+        breakdown: {
+          search: searchData.metrics || null,
+          rerank: rerankMetrics
+        }
+      }
     });
   } catch (error) {
     console.error("Search error:", error);
@@ -694,20 +880,31 @@ app.post('/test-citations', async (req, res) => {
       return res.status(400).json({ error: 'Query is required' });
     }
 
-    
-    const searchResults = await vectorSearch(query, Math.max(limit * 3, 10));
+    const testStartTime = Date.now();
+    const searchData = await vectorSearch(query, Math.max(limit * 3, 10));
+    const searchResults = searchData.results || searchData;
     
     if (searchResults.length === 0) {
       return res.json({
         query,
         message: "No documents found",
         citations: [],
-        sourceSnippets: []
+        sourceSnippets: [],
+        metrics: {
+          totalDuration: Date.now() - testStartTime,
+          totalCost: searchData.metrics?.cost || 0,
+          totalTokens: searchData.metrics?.tokens || 0
+        }
       });
     }
 
-    const rerankedResults = await rerankResults(query, searchResults, limit);
+    const rerankData = await rerankResults(query, searchResults, limit);
+    const rerankedResults = rerankData.results || rerankData;
     const responseWithCitations = await generateResponseWithCitations(query, rerankedResults, []);
+
+    const totalDuration = Date.now() - testStartTime;
+    const totalCost = (searchData.metrics?.cost || 0) + (rerankData.metrics?.cost || 0) + (responseWithCitations.metrics?.cost || 0);
+    const totalTokens = (searchData.metrics?.tokens || 0) + (rerankData.metrics?.tokens || 0) + (responseWithCitations.metrics?.tokens || 0);
 
     res.json({
       query,
@@ -715,7 +912,17 @@ app.post('/test-citations', async (req, res) => {
       citations: responseWithCitations.citations,
       sourceSnippets: responseWithCitations.sourceSnippets,
       totalCandidates: searchResults.length,
-      finalResults: limit
+      finalResults: limit,
+      metrics: {
+        totalDuration,
+        totalCost,
+        totalTokens,
+        breakdown: {
+          search: searchData.metrics || null,
+          rerank: rerankData.metrics || null,
+          response: responseWithCitations.metrics || null
+        }
+      }
     });
   } catch (error) {
     console.error("Test citations error:", error);

@@ -1,0 +1,40 @@
+Here are plain-text referral requests tailored to each role:
+
+---
+
+**1. Full Stack Developer Role – Referral Request**
+
+Hi \[Referrer's Name],
+I hope you're doing well! I came across a Full Stack Developer opening at your company that aligns perfectly with my skills in the MERN stack, Next.js, and real-time features using Socket.io. I also have experience building Retrieval-Augmented Generation (RAG) applications with LangChain, Hugging Face models, and MongoDB Atlas. If you think my background could be a good fit, I’d really appreciate a referral. Let me know if you need my resume or any other details. Thanks so much in advance!
+
+---
+
+**2. Backend Developer Role – Referral Request**
+
+Hi \[Referrer's Name],
+I hope you're doing well! I’m reaching out to see if you’d be open to referring me for the Backend Developer role at your company. I specialize in designing APIs, managing databases, and implementing real-time features with tools like Socket.io. I also work with RAG pipelines using LangChain and Hugging Face models. I’d love to contribute to your team’s backend and AI efforts. Let me know if you'd need my resume or any other info. Thanks a lot!
+
+---
+
+**3. Frontend Developer Role – Referral Request**
+
+Hi \[Referrer's Name],
+Hope you're doing well! I’m very interested in the Frontend Developer position at your company. I have a strong background in React.js, Next.js, Tailwind CSS, and ShadCN, and I’ve also worked on AI-powered RAG applications using Hugging Face and LangChain. I enjoy building intelligent and interactive user interfaces. If it’s not too much trouble, I’d be grateful if you could refer me. Let me know if you’d need my resume. Thanks so much!
+
+---
+
+**4. GenAI Developer Internship – Referral Request**
+
+Hi \[Referrer's Name],
+I hope you’re doing great! I’m applying for the GenAI Developer Internship at your company and would be really thankful if you could refer me. I have experience with the MERN stack, Next.js, Socket.io, and RAG pipelines using LangChain and Hugging Face models. I’m passionate about GenAI and building intelligent, real-time applications. Let me know if you'd like my resume or more info. I’d really appreciate your support!
+
+---
+
+**5. AI Internship – Referral Request**
+
+Hi \[Referrer's Name],
+Hope you're doing well! I’m applying for the AI Internship at your company and was wondering if you’d be open to referring me. I’ve built RAG systems using LangChain, Hugging Face, and vector databases, and have strong full stack experience with MERN and Next.js. I’m excited to grow further in AI and contribute to real-time intelligent applications. Let me know if you’d like any details from my end. Thank you so much in advance!
+
+---
+
+Let me know if you want to adjust tone or add LinkedIn/resume links.
